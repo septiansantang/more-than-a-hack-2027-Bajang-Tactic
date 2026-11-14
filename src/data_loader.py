@@ -318,3 +318,44 @@ def sample_player_coordinates(file_path, sample_interval=10):
         "y": np.array(y_values),
         "speed": np.array(speed_values)
     }
+def load_smart_tagging(xml_path, fps=25):
+    """
+    Membaca file Smart Tagging XML dan mengonversi waktu (detik) ke nomor video frame.
+    Memetakan Team: Barcelona -> 0 (Home), Atletic Club -> 1 (Away), N/A -> -1.
+    """
+    root = ET.parse(xml_path).getroot()
+    events = []
+
+    for instance in root.iter("instance"):
+        start_s = float(instance.findtext("start"))
+        end_s = float(instance.findtext("end"))
+        code = (instance.findtext("code") or "").strip().upper()
+
+        tags = {
+            label.findtext("group"): label.findtext("text")
+            for label in instance.findall("label")
+        }
+
+        team_str = (tags.get("Team") or "N/A").strip()
+        if team_str.lower() == "barcelona":
+            team_code = 0
+        elif team_str.lower() in ("atletic club", "athletic club"):
+            team_code = 1
+        else:
+            team_code = -1
+
+        events.append({
+            "code": code,
+            "start_s": start_s,
+            "end_s": end_s,
+            "start_frame": int(round(start_s * fps)),
+            "end_frame": int(round(end_s * fps)),
+            "team_code": team_code,
+            "team_name": team_str,
+            "half": tags.get("Half"),
+            "type": tags.get("Type"),
+            "side": tags.get("Side"),
+            "direction": tags.get("Direction of ball entry")
+        })
+
+    return events

@@ -203,27 +203,90 @@ def calculate_team_speed_features(record, team_mapping):
     }
 
 
+
+def calculate_ball_kinematics(
+    record,
+    previous_record=None,
+    pitch_length=105.3,
+    pitch_width=68.0,
+    fps=25
+):
+    """
+    Mengekstrak posisi bola (meter), status keluar lapangan,
+    serta kecepatan bola dari perpindahan antar-frame berurutan.
+    """
+    ball = record["ball"]
+
+    if ball is None or not np.isfinite(ball["x"]) or not np.isfinite(ball["y"]):
+        return {
+            "ball_x": np.nan,
+            "ball_y": np.nan,
+            "ball_out_of_bounds": 0,
+            "ball_displacement": np.nan,
+            "ball_speed": np.nan
+        }
+
+    ball_x = float(ball["x"] * pitch_length)
+    ball_y = float(ball["y"] * pitch_width)
+
+    # Cek apakah bola keluar batas lapangan (0 s.d. pitch_length / pitch_width)
+    out_of_bounds = int(
+        ball_x < 0.0 or ball_x > pitch_length or
+        ball_y < 0.0 or ball_y > pitch_width
+    )
+
+    displacement = np.nan
+    derived_speed = np.nan
+
+    if (
+        previous_record is not None
+        and record["frame_id"] == previous_record["frame_id"] + 1
+        and previous_record["ball"] is not None
+    ):
+        prev_ball = previous_record["ball"]
+        prev_x = prev_ball["x"] * pitch_length
+        prev_y = prev_ball["y"] * pitch_width
+
+        if np.isfinite(prev_x) and np.isfinite(prev_y):
+            dx = ball_x - prev_x
+            dy = ball_y - prev_y
+            displacement = float(np.sqrt(dx**2 + dy**2))
+            derived_speed = float(displacement * fps)
+
+    return {
+        "ball_x": ball_x,
+        "ball_y": ball_y,
+        "ball_out_of_bounds": out_of_bounds,
+        "ball_displacement": displacement,
+        "ball_speed": derived_speed
+    }
+
+
 def extract_frame_features(
     record,
     team_mapping,
+    previous_record=None,
     pitch_length=105.3,
     pitch_width=68.0,
     radii=(5, 10)
 ):
     """
-    Menggabungkan seluruh fitur yang dihitung dari satu frame.
+    Menggabungkan seluruh fitur pemain dan kinematika bola dari satu frame.
     """
-
-    # Informasi dasar frame
     frame_id = record["frame_id"]
     ball_detected = record["ball"] is not None
 
-    # Fitur kecepatan pemain tetap dapat dihitung meskipun bola tidak terdeteksi
+    ball_features = calculate_ball_kinematics(
+        record,
+        previous_record=previous_record,
+        pitch_length=pitch_length,
+        pitch_width=pitch_width
+    )
+
     speed_features = calculate_team_speed_features(
         record, team_mapping
     )
 
-    # Inisialisasi fitur berbasis jarak
     distance_features = {
         "nearest_player_distance": np.nan,
         "nearest_player_team": np.nan,
@@ -232,76 +295,88 @@ def extract_frame_features(
         "distance_difference": np.nan
     }
 
-    # Inisialisasi fitur jumlah pemain di sekitar bola
     near_ball_features = {}
-
     for radius in radii:
         near_ball_features[f"home_players_{radius}m"] = np.nan
         near_ball_features[f"away_players_{radius}m"] = np.nan
 
-    # Jarak dan jumlah pemain hanya dihitung jika bola terdeteksi
     if ball_detected:
-
         distances = calculate_player_ball_distances(
             record,
             pitch_length=pitch_length,
             pitch_width=pitch_width
         )
-
-        nearest = analyze_nearest_player(
-            distances, team_mapping
-        )
-
-        team_distances = calculate_team_ball_distances(
-            distances, team_mapping
-        )
+        nearest = analyze_nearest_player(distances, team_mapping)
+        team_distances = calculate_team_ball_distances(distances, team_mapping)
 
         distance_features["nearest_player_distance"] = (
             nearest["nearest_distance"]
-            if nearest["nearest_distance"] is not None
-            else np.nan
+            if nearest["nearest_distance"] is not None else np.nan
         )
-
         distance_features["nearest_player_team"] = (
             nearest["nearest_team"]
-            if nearest["nearest_team"] is not None
-            else np.nan
+            if nearest["nearest_team"] is not None else np.nan
         )
+        distance_features["home_min_distance"] = team_distances["home_min_distance"]
+        distance_features["away_min_distance"] = team_distances["away_min_distance"]
+        distance_features["distance_difference"] = team_distances["distance_difference"]
 
-        distance_features["home_min_distance"] = (
-            team_distances["home_min_distance"]
-        )
-
-        distance_features["away_min_distance"] = (
-            team_distances["away_min_distance"]
-        )
-
-        distance_features["distance_difference"] = (
-            team_distances["distance_difference"]
-        )
-
-        near_counts = count_players_near_ball(
-            distances, team_mapping, radii
-        )
-
+        near_counts = count_players_near_ball(distances, team_mapping, radii)
         for radius in radii:
-            near_ball_features[f"home_players_{radius}m"] = (
-                near_counts[radius]["home_count"]
-            )
-            near_ball_features[f"away_players_{radius}m"] = (
-                near_counts[radius]["away_count"]
-            )
+            near_ball_features[f"home_players_{radius}m"] = near_counts[radius]["home_count"]
+            near_ball_features[f"away_players_{radius}m"] = near_counts[radius]["away_count"]
 
-    # Gabungkan seluruh fitur
-    features = {
+    return {
         "frame_id": frame_id,
         "ball_detected": int(ball_detected),
+        **ball_features,
         **distance_features,
         **near_ball_features,
         **speed_features
     }
 
-    return features
 
+def postprocess_features_df(df, max_gap=50, fps=25):
+    """
+    Menambal celah pendek bola hilang (<= max_gap frame) dengan interpolasi linier
+    dan menghitung sudut belokan arah bola (ball_angle_diff) dalam derajat.
+    """
+    df = df.copy()
 
+    # Interpolasi posisi bola dan jarak pemain untuk celah hilang pendek (<= 50 frame / 2 detik)
+    interp_cols = ["ball_x", "ball_y", "home_min_distance", "away_min_distance"]
+    for col in interp_cols:
+        if col in df.columns:
+            df[col] = df[col].interpolate(method="linear", limit=max_gap, limit_area="inside")
+
+    # Perbarui selisih jarak dan tim terdekat pada frame hasil interpolasi
+    valid_dist = df["home_min_distance"].notna() & df["away_min_distance"].notna()
+    df.loc[valid_dist, "distance_difference"] = (
+        df.loc[valid_dist, "home_min_distance"] - df.loc[valid_dist, "away_min_distance"]
+    ).abs()
+    df.loc[valid_dist & df["nearest_player_team"].isna(), "nearest_player_team"] = np.where(
+        df.loc[valid_dist & df["nearest_player_team"].isna(), "home_min_distance"]
+        <= df.loc[valid_dist & df["nearest_player_team"].isna(), "away_min_distance"],
+        0.0,
+        1.0
+    )
+
+    # Hitung ulang ball_speed pada titik yang diinterpolasi dan sudut belokan vektor
+    dx = df["ball_x"].diff()
+    dy = df["ball_y"].diff()
+    step_dist = np.sqrt(dx**2 + dy**2)
+    df["ball_speed"] = df["ball_speed"].fillna(step_dist * fps)
+
+    # Sudut belokan antara vektor (t-1 -> t) dan (t -> t+1)
+    dx_next = dx.shift(-1)
+    dy_next = dy.shift(-1)
+    norm_prev = np.sqrt(dx**2 + dy**2)
+    norm_next = np.sqrt(dx_next**2 + dy_next**2)
+    denom = norm_prev * norm_next
+
+    cos_angle = np.where(denom > 1e-6, (dx * dx_next + dy * dy_next) / denom, np.nan)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    df["ball_angle_diff"] = np.degrees(np.arccos(cos_angle))
+
+    return df
 
