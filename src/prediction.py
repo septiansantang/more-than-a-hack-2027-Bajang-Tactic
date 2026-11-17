@@ -57,7 +57,12 @@ def default_paths(root: Path | None = None, data_dir: str | Path | None = None) 
     root = Path(root) if root else project_root()
     if data_dir is None:
         env = os.environ.get("MTAH_DATA_DIR")
-        data_dir = Path(env) if env else root / "official-repository" / "more-than-a-hack-2027" / "data"
+        if env:
+            data_dir = Path(env)
+        elif (root / "data" / "tactical").exists():
+            data_dir = root / "data"
+        else:
+            data_dir = root / "official-repository" / "more-than-a-hack-2027" / "data"
     tactical = Path(data_dir) / "tactical"
     return {
         "atd": tactical / "BAR-ATH_tactical_atd.txt",
@@ -73,9 +78,8 @@ def default_paths(root: Path | None = None, data_dir: str | Path | None = None) 
 
 def extract_all(atd_path, metadata_path, out_csv, progress_every: int = 25000) -> int:
     """
-    Tulis fitur setiap frame dari ATD mentah ke CSV (logika sama dengan sel
-    ekstraksi di notebook 03). Mengembalikan jumlah frame yang diproses.
-    Dipanggil otomatis oleh main() bila frame_features.csv belum ada.
+    Tulis fitur setiap frame dari ATD mentah ke CSV.
+    Dipanggil oleh notebook 03 atau otomatis oleh main() bila frame_features.csv belum ada.
     """
     team_mapping = load_metadata(metadata_path)["team_mapping"]
 
@@ -84,14 +88,17 @@ def extract_all(atd_path, metadata_path, out_csv, progress_every: int = 25000) -
 
     processed = 0
     writer = None
+    previous_record = None
     with open(out_csv, "w", newline="", encoding="utf-8") as handle:
         for record in iter_tracking(atd_path):
             features = fe.extract_frame_features(
                 record,
                 team_mapping,
+                previous_record=previous_record,
                 pitch_length=105.3,
                 pitch_width=68.0,
             )
+            previous_record = record
             if writer is None:
                 writer = csv.DictWriter(handle, fieldnames=list(features.keys()), lineterminator="\n")
                 writer.writeheader()
