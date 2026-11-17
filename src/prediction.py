@@ -41,8 +41,8 @@ class PredictionConfig:
     max_gap: int = 50
     temporal: ta.TemporalConfig = field(default_factory=ta.TemporalConfig)
     # Bobot prior Smart Tagging. 0 = dimatikan.
-    tagging_team_weight: float = 0.0
-    tagging_setpiece_weight: float = 0.0
+    tagging_team_weight: float = 0.25
+    tagging_setpiece_weight: float = 0.25
 
 
 # ---------------------------------------------------------------------------

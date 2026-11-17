@@ -55,11 +55,31 @@ class TemporalConfig:
     min_len_d: int = 50
 
 
-def transition_log_matrix(cfg: TemporalConfig) -> np.ndarray:
-    """Matriks log-transisi 3x3 [dari, ke]."""
+def adaptive_transition_log_matrix(cfg: TemporalConfig, frame_features=None, t: int = 0) -> np.ndarray:
+    """
+    Menghitung matriks log-transisi 3x3 yang bersifat dinamis (adaptive) 
+    berdasarkan kecepatan bola dan kepadatan pemain pada frame ke-t.
+    """
     p_ha = cfg.p_switch_ha
     p_hd = cfg.p_to_dead
     p_dx = cfg.p_from_dead
+
+    if frame_features is not None and len(frame_features) > t:
+        # Ambil fitur kecepatan bola dan jumlah pemain di sekitar dari DataFrame fitur
+        b_speed = frame_features.get("ball_speed", np.zeros(len(frame_features)))
+        h_5m = frame_features.get("home_players_5m", np.zeros(len(frame_features)))
+        a_5m = frame_features.get("away_players_5m", np.zeros(len(frame_features)))
+        
+        # Contoh Penyesuaian Adaptif:
+        # 1. Jika bola meluncur kencang (> 8 m/s), naikkan fleksibilitas transisi H <-> A
+        speed_val = b_speed.iloc[t] if hasattr(b_speed, "iloc") else b_speed[t]
+        if np.isfinite(speed_val) and speed_val > 8.0:
+            p_ha *= 1.5  # Lebih mudah berubah kepemilikan saat operan kencang
+
+        # 2. Jika area sangat padat (> 5 pemain di radius 5 meter), naikkan peluang ke Bola Mati (D)
+        crowd_val = (h_5m.iloc[t] + a_5m.iloc[t]) if hasattr(h_5m, "iloc") else (h_5m[t] + a_5m[t])
+        if np.isfinite(crowd_val) and crowd_val > 5.0:
+            p_hd *= 1.4  # Lebih besar peluang kemelut/bola mati di kotak penalti yang padat
 
     trans = np.array(
         [
@@ -69,21 +89,18 @@ def transition_log_matrix(cfg: TemporalConfig) -> np.ndarray:
         ],
         dtype=np.float64,
     )
-    if np.any(trans <= 0):
-        raise ValueError("Probabilitas transisi harus menyisakan peluang tetap > 0.")
+    # Pastikan probabilitas tetap valid (tidak <= 0)
+    trans = np.clip(trans, 1e-6, 1.0 - 1e-6)
     return np.log(trans)
-
 
 # ---------------------------------------------------------------------------
 # Viterbi
 # ---------------------------------------------------------------------------
 
-def viterbi_decode(probs: np.ndarray, config: TemporalConfig | None = None) -> np.ndarray:
+def viterbi_decode(probs: np.ndarray, config: TemporalConfig | None = None, features_df=None) -> np.ndarray:
     """
-    Dekode urutan status paling mungkin (0=H, 1=A, 2=D) dari matriks (N, 3).
-
-    Baris dengan NaN dianggap tidak informatif (emisi seragam).
-    Jalankan terpisah untuk setiap babak.
+    Dekode Viterbi adaptif yang menerima tambahan parameter features_df
+    untuk membaca ball_speed dan kepadatan pemain secara real-time per frame.
     """
     cfg = config or TemporalConfig()
     probs = np.asarray(probs, dtype=np.float64)
@@ -93,7 +110,6 @@ def viterbi_decode(probs: np.ndarray, config: TemporalConfig | None = None) -> n
 
     probs = np.where(np.isfinite(probs), probs, 1.0 / 3.0)
     emit = cfg.temperature * np.log(np.clip(probs, 1e-6, 1.0))
-    log_trans = transition_log_matrix(cfg)
 
     score = np.empty((n, 3), dtype=np.float64)
     back = np.zeros((n, 3), dtype=np.int8)
@@ -101,6 +117,9 @@ def viterbi_decode(probs: np.ndarray, config: TemporalConfig | None = None) -> n
     cols = np.arange(3)
 
     for t in range(1, n):
+        # Ambil matriks log-transisi khusus untuk frame ke-t
+        log_trans = adaptive_transition_log_matrix(cfg, features_df, t)
+        
         cand = score[t - 1][:, None] + log_trans  # [dari, ke]
         best_from = np.argmax(cand, axis=0)
         back[t] = best_from
@@ -287,15 +306,14 @@ def summarize_runs(labels, start: int | None = None, end: int | None = None, fps
     }
 
 
-def decode_halves(probs, halves, config: TemporalConfig | None = None, apply_min_run: bool = True):
-    """
-    Dekode setiap babak secara terpisah. Mengembalikan array label str (N,)
-    dengan 'X' di luar babak. halves = [(awal, akhir_inklusif), ...].
-    """
+def decode_halves(probs, halves, config: TemporalConfig | None = None, apply_min_run: bool = True, features_df=None):
     cfg = config or TemporalConfig()
     labels = np.full(len(probs), "X", dtype="<U1")
     for start, end in halves:
-        path = viterbi_decode(probs[start : end + 1], cfg)
+        # Kirimkan potongan fitur babak tersebut ke viterbi_decode
+        sub_features = features_df.iloc[start : end + 1] if features_df is not None else None
+        path = viterbi_decode(probs[start : end + 1], cfg, features_df=sub_features)
+        
         if apply_min_run:
             path = enforce_min_run(path, cfg.min_len_ha, cfg.min_len_d)
         labels[start : end + 1] = STATE_LABELS[path]
